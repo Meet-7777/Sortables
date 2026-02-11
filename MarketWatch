@@ -1,0 +1,533 @@
+import React, { useMemo, useCallback, useRef } from 'react';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  ActivityIndicator,
+  TextInput,
+  Pressable,
+  Animated,
+} from 'react-native';
+import type { CompositeScreenProps } from '@react-navigation/native';
+import type {
+  MarketWatchTabScreenProps,
+  MarketWatchStackScreenProps,
+} from '../../navigation/types';
+import { fetchMarketWatchItems } from '../../api/watchlist';
+import { authStore } from '../../store/authStore';
+import { marketWatchtab } from '../../store/marketwatchtab';
+import { useTheme } from '../../hooks/useTheme';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import type { ThemeColors } from '../../store/themeStore';
+import { Search, Edit3 } from 'lucide-react-native';
+import { useFocusEffect } from '@react-navigation/native';
+import { sendJoinRoom, sendLeaveRoom } from '../../utils/helper';
+import {
+  nativeSocket,
+  type MarketStreamData,
+} from '../../utils/NativeWebSocket';
+import {
+  getData,
+  getLoading,
+  getError,
+  setData,
+  setLoading,
+  setError,
+  currentLength,
+  type MarketWatchItem,
+} from '../../store/marketwatch';
+import { useSelector, observer } from '@legendapp/state/react';
+import { LegendList } from '@legendapp/list';
+
+type Props = CompositeScreenProps<
+  MarketWatchTabScreenProps,
+  MarketWatchStackScreenProps<'MarketWatchHome'>
+>;
+
+const MarketWatchItemCard = observer(
+  ({ item, onPress }: { item: MarketWatchItem; onPress: () => void }) => {
+    const styles = useThemedStyles(createStyles);
+    const scaleAnim = useRef(new Animated.Value(1)).current;
+
+    const netChange = Number(item.NetChange || 0);
+    const isPositive = netChange > 0;
+    const isNegative = netChange < 0;
+
+    const handlePressIn = () => {
+      Animated.spring(scaleAnim, {
+        toValue: 0.97,
+        useNativeDriver: true,
+        speed: 100,
+        bounciness: 1,
+      }).start();
+    };
+
+    const handlePressOut = () => {
+      Animated.spring(scaleAnim, {
+        toValue: 1,
+        useNativeDriver: true,
+        speed: 100,
+        bounciness: 1,
+      }).start();
+    };
+
+    return (
+      <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
+        <Pressable
+          style={styles.itemCard}
+          onPress={onPress}
+          onPressIn={handlePressIn}
+          onPressOut={handlePressOut}
+        >
+          <View style={styles.itemRow}>
+            <View style={styles.itemLeft}>
+              <Text style={styles.itemSymbol} numberOfLines={1}>
+                {item.symbol || 'N/A'}
+              </Text>
+              <Text style={styles.itemName} numberOfLines={1}>
+                {item.name}
+              </Text>
+            </View>
+
+            <View style={styles.itemRight}>
+              <Text style={styles.itemPrice}>
+                ₹{Number(item.LTPrice || 0).toFixed(2)}
+              </Text>
+              <Text
+                style={[
+                  styles.changeText,
+                  isPositive && styles.changeTextPositive,
+                  isNegative && styles.changeTextNegative,
+                ]}
+              >
+                {netChange > 0 ? '+' : ''}
+                {Number(item.NetChange || 0).toFixed(2)} (
+                {Number(item.NetChangePercentage || 0).toFixed(2)}%)
+              </Text>
+            </View>
+          </View>
+        </Pressable>
+      </Animated.View>
+    );
+  },
+);
+
+MarketWatchItemCard.displayName = 'MarketWatchItemCard';
+
+function MarketWatchTabContent({ navigation, route }: Props) {
+  const watchlistId = route.params?.watchlistId || 'default';
+  const theme = useTheme();
+  const styles = useThemedStyles(createStyles);
+
+  const data = useSelector(() => getData(watchlistId));
+  const isLoading = useSelector(() => getLoading(watchlistId));
+  const error = useSelector(() => getError(watchlistId));
+  const length = useSelector(() => currentLength(watchlistId));
+
+  const tokensRef = useRef<string[]>([]);
+  const tokens = useMemo(() => {
+    const newTokens = data.map(item => item.token);
+
+    if (JSON.stringify(newTokens) !== JSON.stringify(tokensRef.current)) {
+      tokensRef.current = newTokens;
+    }
+    return tokensRef.current;
+  }, [data]);
+
+  const rafIdRef = useRef<number | null>(null);
+  const pendingUpdatesRef = useRef<Map<number, MarketStreamData>>(new Map());
+
+  const { username, marketname } = useSelector(() => {
+    const user = authStore.username.get();
+    const allWatchlists = marketWatchtab.allMarketWatch.get();
+
+    const currentWatchlist = allWatchlists.find(
+      item => item.marketname === watchlistId,
+    );
+
+    return {
+      username: user,
+      marketname: currentWatchlist?.marketname || watchlistId,
+    };
+  });
+
+  const handleRefresh = useCallback(() => {
+    if (!username || marketname === undefined) {
+      return;
+    }
+
+    setLoading(watchlistId, true);
+    setError(watchlistId, null);
+
+    fetchMarketWatchItems(marketname, username)
+      .then(items => {
+        setData(watchlistId, items);
+      })
+      .catch(err => {
+        const errorMessage =
+          err instanceof Error ? err.message : 'Failed to load data';
+        console.error('❌ [handleRefresh] API error:', {
+          watchlistId,
+          marketname,
+          error: errorMessage,
+        });
+        setError(watchlistId, errorMessage);
+      })
+      .finally(() => {
+        setLoading(watchlistId, false);
+      });
+  }, [username, marketname, watchlistId]);
+
+  const fetchData = useCallback(
+    async (forceRefresh = false) => {
+      if (!username || marketname === undefined || !forceRefresh) {
+        return;
+      }
+
+      setLoading(watchlistId, true);
+      setError(watchlistId, null);
+
+      try {
+        const items = await fetchMarketWatchItems(marketname, username);
+        setData(watchlistId, items);
+      } catch (err) {
+        const errorMessage =
+          err instanceof Error ? err.message : 'Failed to load data';
+        console.error('❌ [fetchData] API error:', {
+          watchlistId,
+          marketname,
+          error: errorMessage,
+        });
+        setError(watchlistId, errorMessage);
+      } finally {
+        setLoading(watchlistId, false);
+      }
+    },
+    [marketname, username, watchlistId],
+  );
+
+  const updateMarketData = useCallback(
+    (streamData: MarketStreamData) => {
+      const tokenNumber = Number(streamData.token);
+
+      pendingUpdatesRef.current.set(tokenNumber, streamData);
+
+      if (rafIdRef.current !== null) return;
+
+      rafIdRef.current = requestAnimationFrame(() => {
+        const updates = new Map(pendingUpdatesRef.current);
+        pendingUpdatesRef.current.clear();
+
+        const currentData = getData(watchlistId);
+        const updatedData = currentData.map(item => {
+          const tokenNum = Number(item.token);
+          const update = updates.get(tokenNum);
+
+          if (update) {
+            return {
+              ...item,
+              LTPrice: update.ltp.toString(),
+              NetChange: update.netChange.toString(),
+              NetChangePercentage: update.netChangePercent.toString(),
+              NetChangeIndicator: update.indicator.toString(),
+            };
+          }
+          return item;
+        });
+
+        setData(watchlistId, updatedData);
+        rafIdRef.current = null;
+      });
+    },
+    [watchlistId],
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!username || marketname === undefined) {
+        return;
+      }
+
+      const unsubscribeMarketData = nativeSocket.onMarketData(updateMarketData);
+      const unsubscribeReconnect = nativeSocket.onReconnect(() => {
+        if (tokens.length > 0) {
+          sendJoinRoom(tokens);
+        }
+      });
+
+      if (tokens.length > 0) {
+        sendJoinRoom(tokens);
+      }
+
+      return () => {
+        unsubscribeMarketData();
+        unsubscribeReconnect();
+
+        if (rafIdRef.current !== null) {
+          cancelAnimationFrame(rafIdRef.current);
+          rafIdRef.current = null;
+        }
+
+        pendingUpdatesRef.current.clear();
+
+        if (tokens.length > 0) {
+          sendLeaveRoom(tokens);
+        }
+      };
+    }, [updateMarketData, tokens, username, marketname]),
+  );
+
+  const handleSearch = () => {
+    navigation.navigate('Search', { watchlistId });
+  };
+
+  const handleItemPress = useCallback(
+    (item: MarketWatchItem) => {
+      navigation.navigate('MarketWatchMBP', {
+        token: item.token,
+        watchlistId,
+        marketWatchItem: item,
+      });
+    },
+    [navigation, watchlistId],
+  );
+
+  const handleEditPress = useCallback(() => {
+    navigation.navigate('Delete', { watchlistId, marketname });
+  }, [navigation, watchlistId, marketname]);
+
+  const renderItem = useCallback(
+    ({ item }: { item: MarketWatchItem }) => {
+      return (
+        <MarketWatchItemCard
+          item={item}
+          onPress={() => handleItemPress(item)}
+        />
+      );
+    },
+    [handleItemPress],
+  );
+
+  const keyExtractor = useCallback(
+    (item: MarketWatchItem, index: number) =>
+      `${watchlistId}-${item.token || index}`,
+    [watchlistId],
+  );
+
+  if (isLoading) {
+    return (
+      <View style={[styles.container, styles.centerContent]}>
+        <ActivityIndicator size="large" color={theme.primary} />
+        <Text style={styles.loadingText}>Loading market data...</Text>
+      </View>
+    );
+  }
+
+  if (error) {
+    return (
+      <View style={[styles.container, styles.centerContent]}>
+        <Text style={styles.errorText}>Error: {error}</Text>
+        <TouchableOpacity style={styles.button} onPress={() => fetchData(true)}>
+          <Text style={styles.buttonText}>Retry</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.searchContainer}>
+        <Pressable style={styles.searchBox} onPress={handleSearch}>
+          <Search size={16} color={theme.textSecondary} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search stocks..."
+            placeholderTextColor={theme.textSecondary}
+            editable={false}
+            pointerEvents="none"
+          />
+          <Text style={styles.counterText}>{length}/100</Text>
+        </Pressable>
+        <Pressable style={styles.editButton} onPress={handleEditPress}>
+          <Edit3 size={20} color={theme.text} />
+        </Pressable>
+      </View>
+
+      {data.length > 0 ? (
+        <LegendList
+          data={data}
+          keyExtractor={keyExtractor}
+          renderItem={renderItem}
+          onRefresh={handleRefresh}
+          refreshing={isLoading}
+          showsVerticalScrollIndicator={false}
+        />
+      ) : (
+        <View style={styles.emptyContainer}>
+          <Text style={styles.emptyText}>No items in this watchlist</Text>
+          <TouchableOpacity style={styles.addButton} onPress={handleSearch}>
+            <Text style={styles.addButtonText}>Add Stocks</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </View>
+  );
+}
+
+export default MarketWatchTabContent;
+
+const createStyles = (theme: ThemeColors) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.background,
+    },
+    centerContent: {
+      justifyContent: 'center',
+      alignItems: 'center',
+      padding: 20,
+    },
+    searchContainer: {
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      backgroundColor: theme.card,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.border,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+    },
+    editButton: {
+      backgroundColor: theme.input,
+      borderRadius: 8,
+      padding: 8,
+      justifyContent: 'center',
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: theme.inputBorder,
+    },
+    searchBox: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.input,
+      borderRadius: 8,
+      paddingHorizontal: 10,
+      paddingVertical: 8,
+      borderWidth: 1,
+      borderColor: theme.inputBorder,
+    },
+    searchInput: {
+      flex: 1,
+      marginLeft: 6,
+      fontSize: 14,
+      color: theme.text,
+    },
+    listContent: {
+      paddingVertical: 8,
+    },
+    itemCard: {
+      backgroundColor: theme.card,
+      paddingHorizontal: 16,
+      paddingVertical: 14,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.border,
+    },
+
+    itemRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
+    itemLeft: {
+      flex: 1,
+      marginRight: 16,
+    },
+    itemRight: {
+      alignItems: 'flex-end',
+    },
+    itemSymbol: {
+      fontSize: 14,
+      fontWeight: '600',
+      color: theme.text,
+      marginBottom: 4,
+    },
+    itemName: {
+      fontSize: 13,
+      color: theme.textSecondary,
+      fontWeight: '400',
+    },
+    itemPrice: {
+      fontSize: 16,
+      fontWeight: '600',
+      color: theme.text,
+      marginBottom: 4,
+    },
+    changeText: {
+      fontSize: 13,
+      fontWeight: '500',
+      color: theme.textSecondary,
+    },
+    changeTextPositive: {
+      color: theme.positive,
+    },
+    changeTextNegative: {
+      color: theme.negative,
+    },
+    counterText: {
+      fontSize: 12,
+      color: theme.textSecondary,
+      fontWeight: '500',
+      marginLeft: 8,
+    },
+    loadingText: {
+      marginTop: 12,
+      fontSize: 15,
+      color: theme.textSecondary,
+      fontWeight: '400',
+    },
+    errorText: {
+      fontSize: 15,
+      color: theme.error,
+      textAlign: 'center',
+      marginBottom: 20,
+      fontWeight: '400',
+    },
+    emptyContainer: {
+      flex: 1,
+      justifyContent: 'center',
+      alignItems: 'center',
+      padding: 40,
+    },
+    emptyText: {
+      fontSize: 15,
+      color: theme.textSecondary,
+      marginBottom: 20,
+      textAlign: 'center',
+      fontWeight: '400',
+    },
+    button: {
+      backgroundColor: theme.primary,
+      paddingVertical: 12,
+      paddingHorizontal: 24,
+      borderRadius: 8,
+    },
+    buttonText: {
+      color: '#fff',
+      fontSize: 15,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
+    addButton: {
+      backgroundColor: theme.primary,
+      paddingVertical: 12,
+      paddingHorizontal: 24,
+      borderRadius: 8,
+    },
+    addButtonText: {
+      color: '#fff',
+      fontSize: 15,
+      fontWeight: '600',
+    },
+  });
